@@ -361,6 +361,15 @@ class Fp8LinearMethod(LinearMethodBase):
             set_weight_attrs(scale, {"scale_type": "input_scale"})
             layer.register_parameter("input_scale", scale)
 
+        # Serialized (offline) fp8 on parts without native fp8 (sm80/86):
+        # the natural selection can land on the torch/dequant fallback which
+        # decodes every dense GEMM's weights at runtime (the -73% official-
+        # weights decode). MarlinFP8ScaledMMLinearKernel natively handles the
+        # 128x128 block scales and runs W8A16 — force it, matching the online
+        # path. (ported from avtc/vllm-backport PR #106)
+        force = (
+            None if cutlass_fp8_supported() else MarlinFP8ScaledMMLinearKernel
+        )
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=self.activation_quant_key,
             weight_quant_key=self.weight_quant_key,
@@ -368,6 +377,7 @@ class Fp8LinearMethod(LinearMethodBase):
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
+            force_kernel=force,
         )
 
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
