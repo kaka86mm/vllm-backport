@@ -266,7 +266,7 @@ class MiMoV2MTP(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        pending_fp8_qkv: dict[str, dict[str, torch.Tensor]] = {}
+        fp8_qkv_pending: dict[str, dict[str, torch.Tensor]] = {}
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -280,51 +280,84 @@ class MiMoV2MTP(nn.Module):
             ):
                 continue
 
-            # Fused qkv_proj checkpoint (Pro format), stored as per-KV-head
-            # [Q | K | V] groups. FP8 weight and block scale must be sharded
-            # together: a group is not a whole number of scale blocks, so
-            # chunking them independently mis-scales every rank whose rows
-            # start mid-block. Reuse the main model's sharder.
+            # Fused qkv_proj (Pro format): the checkpoint stores the fused
+            # QKV pre-sharded for the quant-time TP (NB=4 blocks of
+            # [Q|K|V]), the same layout as the main model — NOT per-serving-
+            # rank slices, so a plain chunk(tp_size) scrambles K/V and
+            # mis-slices the fp8 block scales. The fp8 weight and its
+            # weight_scale_inv arrive as separate tensors and are sharded
+            # together once both are buffered.
             if "qkv_proj" in name:
-                if name not in params_dict:
+                base, _, kind = name.rpartition(".")
+                if f"{base}.weight" not in params_dict:
+                    # The draft model builds only the MTP layers it uses
+                    # (EAGLE semantics: one reused layer); skip the rest.
                     continue
-                is_fp8_weight = (
-                    name.endswith("qkv_proj.weight")
-                    and loaded_weight.dtype == torch.float8_e4m3fn
+                is_fp8_weight = kind == "weight" and (
+                    loaded_weight.dtype == torch.float8_e4m3fn
                 )
-                if is_fp8_weight or name.endswith("qkv_proj.weight_scale_inv"):
-                    prefix, kind = name.rsplit(".", 1)
-                    entry = pending_fp8_qkv.setdefault(prefix, {})
-                    entry[kind] = loaded_weight
-                    if "weight" in entry and "weight_scale_inv" in entry:
-                        del pending_fp8_qkv[prefix]
-                        attn = self.get_submodule(prefix.rsplit(".", 1)[0])
-                        w_rank, s_rank = _shard_fp8_qkv_proj(
-                            entry["weight"],
-                            entry["weight_scale_inv"],
-                            num_heads=attn.total_num_heads,
-                            num_kv_heads=attn.total_num_kv_heads,
-                            head_dim=attn.head_dim,
-                            v_head_dim=attn.v_head_dim,
-                            tp_rank=tp_rank,
-                            tp_size=tp_size,
-                            ckpt_tp=self.config.num_key_value_heads,
-                        )
-                        for kind_, tensor in (
-                            ("weight", w_rank),
-                            ("weight_scale_inv", s_rank),
-                        ):
-                            param_name = f"{prefix}.{kind_}"
-                            param = params_dict[param_name]
-                            if tensor.shape[0] > param.shape[0]:
-                                tensor = tensor[: param.shape[0]]
-                            default_weight_loader(param, tensor)
-                            loaded_params.add(param_name)
+                is_scale = kind == "weight_scale_inv"
+                if is_fp8_weight or is_scale:
+                    entry = fp8_qkv_pending.setdefault(base, {})
+                    entry["w" if is_fp8_weight else "s"] = loaded_weight
+                    if "w" not in entry or "s" not in entry:
+                        continue
+                    del fp8_qkv_pending[base]
+                    attn = self.get_submodule(base.rsplit(".qkv_proj", 1)[0])
+                    w_r, s_r = _shard_fp8_qkv_proj(
+                        entry["w"],
+                        entry["s"],
+                        num_heads=attn.total_num_heads,
+                        num_kv_heads=attn.total_num_kv_heads,
+                        head_dim=attn.head_dim,
+                        v_head_dim=attn.v_head_dim,
+                        tp_rank=tp_rank,
+                        tp_size=tp_size,
+                        kv_chunk_rows=getattr(attn, "kv_chunk_rows", 0),
+                    )
+                    for pname, tensor in (
+                        (f"{base}.weight", w_r),
+                        (f"{base}.weight_scale_inv", s_r),
+                    ):
+                        param = params_dict[pname]
+                        if tensor.shape[0] > param.shape[0]:
+                            tensor = tensor[: param.shape[0]]
+                        default_weight_loader(param, tensor)
+                        loaded_params.add(pname)
                     continue
-                param = params_dict[name]
-                loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
-                default_weight_loader(param, loaded_weight)
-                loaded_params.add(name)
+                if kind == "weight" and base in {
+                    n[: -len(".weight")] for n in params_dict
+                }:
+                    # Unquantized fused qkv: de-shard the NB=4 blocks into
+                    # head-ordered all_q/all_k/all_v and slice for this rank
+                    # (no scale constraint, rows may split anywhere).
+                    nb = 4
+                    attn = self.get_submodule(base.rsplit(".qkv_proj", 1)[0])
+                    nh = attn.total_num_heads
+                    nkv = attn.total_num_kv_heads
+                    hd = attn.head_dim
+                    vhd = attn.v_head_dim
+                    bq = (nh // nb) * hd
+                    bk = (nkv // nb) * hd
+                    bv = (nkv // nb) * vhd
+                    blocks = loaded_weight.view(nb, bq + bk + bv, -1)
+                    all_q = blocks[:, :bq, :].reshape(nh * hd, -1)
+                    all_k = blocks[:, bq : bq + bk, :].reshape(nkv * hd, -1)
+                    all_v = blocks[:, bq + bk :, :].reshape(nkv * vhd, -1)
+                    nhr = nh // tp_size
+                    q = all_q[tp_rank * nhr * hd : (tp_rank + 1) * nhr * hd, :]
+                    if nkv >= tp_size:
+                        kvr = nkv // tp_size
+                        k = all_k[tp_rank * kvr * hd : (tp_rank + 1) * kvr * hd, :]
+                        v = all_v[tp_rank * kvr * vhd : (tp_rank + 1) * kvr * vhd, :]
+                    else:
+                        kvi = tp_rank // (tp_size // nkv)
+                        k = all_k[kvi * hd : (kvi + 1) * hd, :]
+                        v = all_v[kvi * vhd : (kvi + 1) * vhd, :]
+                    default_weight_loader(
+                        params_dict[f"{base}.weight"], torch.cat([q, k, v], dim=0)
+                    )
+                    loaded_params.add(f"{base}.weight")
                 continue
 
             # gate_proj/up_proj → gate_up_proj stacking (both formats);

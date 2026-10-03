@@ -263,7 +263,7 @@ class MiMoVisionAttention(nn.Module):
             sliding_window_q=w,
             sliding_window_k=w,
             sinks=sinks,
-            sinks_bias_key0=True,
+            sinks_bias_key0=False,
         )
         return output
 
@@ -1242,6 +1242,8 @@ class MiMoV2OmniDummyInputsBuilder(BaseDummyInputsBuilder[MiMoV2OmniProcessingIn
 class MiMoV2OmniForCausalLM(
     nn.Module, SupportsMultiModal, SupportsPP, SupportsQuant, SupportsEagle3
 ):
+    packed_modules_mapping = MiMoV2FlashForCausalLM.packed_modules_mapping.copy()
+
     # To ensure correct weight loading and mapping.
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -1288,7 +1290,16 @@ class MiMoV2OmniForCausalLM(
         audio_config = getattr(config, "audio_config", None)
         model_path = vllm_config.model_config.model
         self.audio_encoder: MimoAudioEncoder | None
-        if audio_config is not None:
+        # Skip the audio tower entirely when the serving config allows
+        # no audio items (limit_mm_per_prompt audio=0): it is never
+        # exercised and only costs the 1.9 GB tower build + weight
+        # read per boot and its VRAM. (ported from avtc/vllm-backport
+        # PR #106, adapted: no enable_mm_embeds in this fork)
+        mm_config = vllm_config.model_config.get_multimodal_config()
+        audio_needed = audio_config is not None and (
+            mm_config is None or mm_config.get_limit_per_prompt("audio") != 0
+        )
+        if audio_needed:
             with self._mark_tower_model(vllm_config, "audio"):
                 self.audio_encoder = MimoAudioEncoder(
                     audio_config, model_path=model_path
@@ -1581,6 +1592,16 @@ class MiMoV2OmniForCausalLM(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         audio_loaded: set[str] = set()
+        if self.audio_encoder is None:
+            # Tower not built (audio limit 0): drop its checkpoint
+            # weights instead of failing AutoWeightsLoader on
+            # missing modules.
+            audio_prefixes = ("audio_encoder.", "speech_embeddings.")
+            weights = (
+                (name, tensor)
+                for name, tensor in weights
+                if not name.startswith(audio_prefixes)
+            )
 
         loader = AutoWeightsLoader(self)
         auto_loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
