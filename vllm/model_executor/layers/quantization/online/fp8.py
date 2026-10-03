@@ -194,6 +194,15 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
             **extra_weight_attrs,
         )
 
+        # On parts without native fp8 (sm80/86) the per-tensor torch
+        # fallback claims per-tensor configs but cannot run fp8
+        # _scaled_mm there, and its dynamic activation key never
+        # quantizes x -> bf16 x fp8 matmul crash. Route to weight-only
+        # Marlin (W8A16), matching what the offline fp8 path does on
+        # the same devices. (ported from avtc/vllm-backport PR #106)
+        force = (
+            None if cutlass_fp8_supported() else MarlinFP8ScaledMMLinearKernel
+        )
         self.fp8_linear = init_fp8_linear_kernel(
             activation_quant_key=self.activation_quant_key,
             weight_quant_key=self.weight_quant_key,
@@ -201,6 +210,7 @@ class Fp8PerTensorOnlineLinearMethod(OnlineLinearBase):
             input_dtype=self.input_dtype,
             out_dtype=self.out_dtype,
             module_name=self.__class__.__name__,
+            force_kernel=force,
         )
         self.use_marlin = isinstance(self.fp8_linear, MarlinFP8ScaledMMLinearKernel)
 
