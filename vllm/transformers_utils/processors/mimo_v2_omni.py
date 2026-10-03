@@ -192,6 +192,12 @@ def _transform_single(
 ) -> tuple[torch.Tensor, int, int]:
     if isinstance(img, torch.Tensor):
         t = img.float()
+        # vLLM hands the image branch float tensors in [0, 1]; the pixel
+        # mean/std below are calibrated for [0, 255] (SGLang convention).
+        # Without this rescale the chroma signal collapses to ~0.3 sigma and
+        # the model reads colorful images as near-neutral (white/grey).
+        if float(t.max()) <= 1.5:
+            t = t * 255.0
         _, h, w = t.shape
     elif isinstance(img, Image.Image):
         img = img.convert("RGB")
